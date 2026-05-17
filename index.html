@@ -1,0 +1,1121 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+
+// ─── GOOGLE SHEETS CONFIG ────────────────────────────────────────────────────
+// Fill these in after setup (see Settings panel for instructions)
+const DEFAULT_CONFIG = {
+  spreadsheetId: "",
+  apiKey: "",
+  clientId: "",
+};
+
+// ─── SHEET NAMES ─────────────────────────────────────────────────────────────
+const SHEETS = {
+  INCOME: "Income",
+  JOINT: "JointExpenses",
+  PARTNER_A: "PartnerA",
+  PARTNER_B: "PartnerB",
+  GOALS: "Goals",
+  CONFIG: "Config",
+};
+
+// ─── COLOR PALETTE (Amex-inspired: crisp whites, warm grays, blue accent) ────
+const C = {
+  blue: "#006FCF",
+  blueLight: "#E8F1FB",
+  blueMid: "#C2D9F5",
+  teal: "#007A73",
+  tealLight: "#E0F2F1",
+  coral: "#C85C3A",
+  coralLight: "#FAEDE8",
+  amber: "#B07D1B",
+  amberLight: "#FBF3E0",
+  green: "#2E7D32",
+  greenLight: "#EAF3EA",
+  gray50: "#FAFAFA",
+  gray100: "#F4F4F4",
+  gray200: "#E8E8E8",
+  gray400: "#ABABAB",
+  gray600: "#6B6B6B",
+  gray800: "#2C2C2C",
+  white: "#FFFFFF",
+  joint: "#006FCF",
+  jointLight: "#E8F1FB",
+  partnerA: "#007A73",
+  partnerALight: "#E0F2F1",
+  partnerB: "#C85C3A",
+  partnerBLight: "#FAEDE8",
+};
+
+// ─── GOOGLE SHEETS API HELPERS ────────────────────────────────────────────────
+let gapiLoaded = false;
+let gisLoaded = false;
+let tokenClient = null;
+let accessToken = null;
+
+async function sheetsGet(spreadsheetId, range, apiKey) {
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(range)}?key=${apiKey}`;
+  const r = await fetch(url, accessToken ? { headers: { Authorization: `Bearer ${accessToken}` } } : {});
+  if (!r.ok) throw new Error(`Sheets GET failed: ${r.status}`);
+  const d = await r.json();
+  return d.values || [];
+}
+
+async function sheetsAppend(spreadsheetId, range, values) {
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(range)}:append?valueInputOption=USER_ENTERED`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+    body: JSON.stringify({ values }),
+  });
+  if (!r.ok) throw new Error(`Sheets APPEND failed: ${r.status}`);
+  return r.json();
+}
+
+async function sheetsUpdate(spreadsheetId, range, values) {
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(range)}?valueInputOption=USER_ENTERED`;
+  const r = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+    body: JSON.stringify({ values }),
+  });
+  if (!r.ok) throw new Error(`Sheets UPDATE failed: ${r.status}`);
+  return r.json();
+}
+
+async function sheetsClear(spreadsheetId, range) {
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(range)}:clear`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+  });
+  if (!r.ok) throw new Error(`Sheets CLEAR failed: ${r.status}`);
+  return r.json();
+}
+
+// ─── LOCAL STORAGE FALLBACK (when Sheets not configured) ──────────────────────
+const LS = {
+  get: (k, def) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : def; } catch { return def; } },
+  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+
+// ─── DEFAULT SAMPLE DATA ──────────────────────────────────────────────────────
+const SAMPLE_INCOME = [
+  { id: "i1", date: "2025-05-01", source: "Salary - Alex", amount: 3500, tithing: 350, needs: 1750, savings: 700, wants: 700 },
+  { id: "i2", date: "2025-05-15", source: "Freelance", amount: 800, tithing: 80, needs: 400, savings: 160, wants: 160 },
+];
+const SAMPLE_JOINT = [
+  { id: "j1", date: "2025-05-02", name: "Rent", category: "Housing", paidBy: "Alex", amount: 1200 },
+  { id: "j2", date: "2025-05-05", name: "Groceries", category: "Food", paidBy: "Jordan", amount: 280 },
+  { id: "j3", date: "2025-05-10", name: "Electric Bill", category: "Utilities", paidBy: "Alex", amount: 95 },
+  { id: "j4", date: "2025-05-12", name: "Internet", category: "Utilities", paidBy: "Jordan", amount: 60 },
+];
+const SAMPLE_PARTNER_A = [
+  { id: "a1", date: "2025-05-03", name: "Gym Membership", category: "Health", amount: 45, type: "Bill" },
+  { id: "a2", date: "2025-05-08", name: "Coffee", category: "Wants", amount: 35, type: "Want" },
+];
+const SAMPLE_PARTNER_B = [
+  { id: "b1", date: "2025-05-04", name: "Spotify", category: "Entertainment", amount: 12, type: "Bill" },
+  { id: "b2", date: "2025-05-09", name: "Clothing", category: "Wants", amount: 80, type: "Want" },
+];
+const SAMPLE_GOALS = [
+  { id: "g1", name: "Emergency Fund", target: 10000, saved: 3200, monthly: 400, category: "Emergency" },
+  { id: "g2", name: "Business Fund", target: 5000, saved: 1100, monthly: 200, category: "Business" },
+  { id: "g3", name: "Dirt Bike", target: 3500, saved: 650, monthly: 150, category: "Want" },
+  { id: "g4", name: "Home Maintenance", target: 2000, saved: 800, monthly: 100, category: "Maintenance" },
+];
+const DEFAULT_ALLOCATIONS = { tithing: 10, needs: 50, savings: 20, wants: 20 };
+const PARTNER_NAMES_DEFAULT = { a: "Alex", b: "Jordan" };
+
+// ─── UTILITIES ────────────────────────────────────────────────────────────────
+const fmt = (n) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(n || 0);
+const fmtDec = (n) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n || 0);
+const uid = () => Math.random().toString(36).slice(2, 9);
+const today = () => new Date().toISOString().slice(0, 10);
+const monthKey = (d) => d ? d.slice(0, 7) : "";
+const pct = (a, b) => b ? Math.min(100, Math.round((a / b) * 100)) : 0;
+
+// ─── DONUT CHART (pure SVG, no library) ───────────────────────────────────────
+function DonutChart({ data, size = 180, thickness = 32, label, sublabel }) {
+  const r = (size - thickness) / 2;
+  const cx = size / 2, cy = size / 2;
+  const circumference = 2 * Math.PI * r;
+  let offset = 0;
+  const total = data.reduce((s, d) => s + d.value, 0);
+  const segments = data.map((d) => {
+    const pctVal = total > 0 ? d.value / total : 0;
+    const dash = pctVal * circumference;
+    const gap = circumference - dash;
+    const seg = { ...d, dash, gap, offset };
+    offset += dash;
+    return seg;
+  });
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} style={{ display: "block", margin: "0 auto" }}>
+      <circle cx={cx} cy={cy} r={r} fill="none" stroke={C.gray200} strokeWidth={thickness} />
+      {segments.map((s, i) => (
+        <circle
+          key={i} cx={cx} cy={cy} r={r} fill="none"
+          stroke={s.color} strokeWidth={thickness}
+          strokeDasharray={`${s.dash} ${s.gap}`}
+          strokeDashoffset={-s.offset + circumference * 0.25}
+          style={{ transition: "stroke-dasharray 0.5s ease" }}
+        />
+      ))}
+      {label && <text x={cx} y={cy - 8} textAnchor="middle" fontSize="18" fontWeight="600" fill={C.gray800}>{label}</text>}
+      {sublabel && <text x={cx} y={cy + 14} textAnchor="middle" fontSize="12" fill={C.gray600}>{sublabel}</text>}
+    </svg>
+  );
+}
+
+// ─── PROGRESS BAR ─────────────────────────────────────────────────────────────
+function ProgressBar({ value, color = C.blue, height = 8 }) {
+  return (
+    <div style={{ background: C.gray200, borderRadius: 99, height, overflow: "hidden", width: "100%" }}>
+      <div style={{ width: `${Math.min(100, value)}%`, height: "100%", background: color, borderRadius: 99, transition: "width 0.5s ease" }} />
+    </div>
+  );
+}
+
+// ─── BADGE ────────────────────────────────────────────────────────────────────
+function Badge({ label, color, bg }) {
+  return (
+    <span style={{ background: bg || C.blueLight, color: color || C.blue, fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 99, letterSpacing: "0.02em", whiteSpace: "nowrap" }}>
+      {label}
+    </span>
+  );
+}
+
+// ─── CARD ─────────────────────────────────────────────────────────────────────
+function Card({ children, style }) {
+  return (
+    <div style={{ background: C.white, border: `1px solid ${C.gray200}`, borderRadius: 16, padding: "20px 24px", ...style }}>
+      {children}
+    </div>
+  );
+}
+
+// ─── STAT CARD ────────────────────────────────────────────────────────────────
+function StatCard({ label, value, sub, color, bg, icon }) {
+  return (
+    <div style={{ background: bg || C.gray50, border: `1px solid ${C.gray200}`, borderRadius: 14, padding: "16px 20px", minWidth: 0 }}>
+      <div style={{ fontSize: 12, color: C.gray600, fontWeight: 500, marginBottom: 6, letterSpacing: "0.04em", textTransform: "uppercase" }}>{label}</div>
+      <div style={{ fontSize: 24, fontWeight: 700, color: color || C.gray800, letterSpacing: "-0.02em" }}>{value}</div>
+      {sub && <div style={{ fontSize: 12, color: C.gray600, marginTop: 4 }}>{sub}</div>}
+    </div>
+  );
+}
+
+// ─── MODAL ────────────────────────────────────────────────────────────────────
+function Modal({ open, onClose, title, children }) {
+  if (!open) return null;
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ background: C.white, borderRadius: 20, padding: 28, width: "100%", maxWidth: 500, maxHeight: "90vh", overflowY: "auto", boxShadow: "0 8px 40px rgba(0,0,0,0.18)" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
+          <h3 style={{ margin: 0, fontSize: 17, fontWeight: 700, color: C.gray800 }}>{title}</h3>
+          <button onClick={onClose} style={{ background: C.gray100, border: "none", borderRadius: 99, width: 32, height: 32, cursor: "pointer", fontSize: 18, color: C.gray600, display: "flex", alignItems: "center", justifyContent: "center" }}>x</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// ─── INPUT ────────────────────────────────────────────────────────────────────
+const inputStyle = {
+  width: "100%", padding: "10px 12px", border: `1px solid ${C.gray200}`, borderRadius: 10,
+  fontSize: 14, color: C.gray800, background: C.white, boxSizing: "border-box", outline: "none",
+  fontFamily: "inherit",
+};
+const labelStyle = { display: "block", fontSize: 12, fontWeight: 600, color: C.gray600, marginBottom: 5, letterSpacing: "0.03em", textTransform: "uppercase" };
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+export default function BudgetDashboard() {
+  // Config
+  const [config, setConfig] = useState(() => LS.get("budget_config", DEFAULT_CONFIG));
+  const [partnerNames, setPartnerNames] = useState(() => LS.get("partner_names", PARTNER_NAMES_DEFAULT));
+  const [allocPct, setAllocPct] = useState(() => LS.get("alloc_pct", DEFAULT_ALLOCATIONS));
+  const [sheetsConnected, setSheetsConnected] = useState(false);
+  const [syncStatus, setSyncStatus] = useState("local");
+
+  // Data
+  const [income, setIncome] = useState(() => LS.get("income_data", SAMPLE_INCOME));
+  const [joint, setJoint] = useState(() => LS.get("joint_data", SAMPLE_JOINT));
+  const [partnerA, setPartnerA] = useState(() => LS.get("partner_a_data", SAMPLE_PARTNER_A));
+  const [partnerB, setPartnerB] = useState(() => LS.get("partner_b_data", SAMPLE_PARTNER_B));
+  const [goals, setGoals] = useState(() => LS.get("goals_data", SAMPLE_GOALS));
+
+  // UI
+  const [tab, setTab] = useState("dashboard");
+  const [personalTab, setPersonalTab] = useState("a");
+  const [filterMonth, setFilterMonth] = useState(today().slice(0, 7));
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [modal, setModal] = useState(null); // { type, data }
+  const [editingGoal, setEditingGoal] = useState(null);
+  const [isMobile, setIsMobile] = useState(window.innerWidth < 700);
+  const syncTimer = useRef(null);
+
+  useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth < 700);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // ── Persist to localStorage ────────────────────────────────────────────────
+  useEffect(() => { LS.set("income_data", income); }, [income]);
+  useEffect(() => { LS.set("joint_data", joint); }, [joint]);
+  useEffect(() => { LS.set("partner_a_data", partnerA); }, [partnerA]);
+  useEffect(() => { LS.set("partner_b_data", partnerB); }, [partnerB]);
+  useEffect(() => { LS.set("goals_data", goals); }, [goals]);
+  useEffect(() => { LS.set("alloc_pct", allocPct); }, [allocPct]);
+  useEffect(() => { LS.set("partner_names", partnerNames); }, [partnerNames]);
+  useEffect(() => { LS.set("budget_config", config); }, [config]);
+
+  // ── Google Sheets OAuth ───────────────────────────────────────────────────
+  const signInSheets = useCallback(() => {
+    if (!config.clientId || !config.spreadsheetId || !config.apiKey) {
+      alert("Please fill in Spreadsheet ID, API Key, and Client ID in Settings first.");
+      return;
+    }
+    if (!tokenClient) {
+      if (!window.google) { alert("Google Identity Services not loaded. Check your internet connection."); return; }
+      tokenClient = window.google.accounts.oauth2.initTokenClient({
+        client_id: config.clientId,
+        scope: "https://www.googleapis.com/auth/spreadsheets",
+        callback: (resp) => {
+          if (resp.error) { alert("Sign-in failed: " + resp.error); return; }
+          accessToken = resp.access_token;
+          setSheetsConnected(true);
+          setSyncStatus("synced");
+          pullFromSheets();
+        },
+      });
+    }
+    tokenClient.requestAccessToken();
+  }, [config]);
+
+  // ── Pull all data from Sheets ─────────────────────────────────────────────
+  const pullFromSheets = useCallback(async () => {
+    if (!sheetsConnected || !config.spreadsheetId) return;
+    setSyncStatus("syncing");
+    try {
+      const parse = (rows, keys) => rows.slice(1).map((r, i) => {
+        const obj = { id: r[0] || uid() };
+        keys.forEach((k, j) => { obj[k] = r[j + 1] || ""; });
+        return obj;
+      });
+      const [iRows, jRows, aRows, bRows, gRows] = await Promise.all([
+        sheetsGet(config.spreadsheetId, `${SHEETS.INCOME}!A:J`, config.apiKey),
+        sheetsGet(config.spreadsheetId, `${SHEETS.JOINT}!A:G`, config.apiKey),
+        sheetsGet(config.spreadsheetId, `${SHEETS.PARTNER_A}!A:G`, config.apiKey),
+        sheetsGet(config.spreadsheetId, `${SHEETS.PARTNER_B}!A:G`, config.apiKey),
+        sheetsGet(config.spreadsheetId, `${SHEETS.GOALS}!A:G`, config.apiKey),
+      ]);
+      if (iRows.length > 1) setIncome(parse(iRows, ["date","source","amount","tithing","needs","savings","wants"]));
+      if (jRows.length > 1) setJoint(parse(jRows, ["date","name","category","paidBy","amount"]));
+      if (aRows.length > 1) setPartnerA(parse(aRows, ["date","name","category","amount","type"]));
+      if (bRows.length > 1) setPartnerB(parse(bRows, ["date","name","category","amount","type"]));
+      if (gRows.length > 1) setGoals(parse(gRows, ["name","target","saved","monthly","category"]));
+      setSyncStatus("synced");
+    } catch (e) {
+      setSyncStatus("error");
+      console.error("Sheets pull error:", e);
+    }
+  }, [sheetsConnected, config]);
+
+  // ── Push all data to Sheets ───────────────────────────────────────────────
+  const pushToSheets = useCallback(async (sheet, data, headers, rowFn) => {
+    if (!sheetsConnected || !config.spreadsheetId) return;
+    setSyncStatus("syncing");
+    try {
+      await sheetsClear(config.spreadsheetId, `${sheet}!A:Z`);
+      const rows = [headers, ...data.map(rowFn)];
+      await sheetsAppend(config.spreadsheetId, `${sheet}!A1`, rows);
+      setSyncStatus("synced");
+    } catch (e) {
+      setSyncStatus("error");
+      console.error("Sheets push error:", e);
+    }
+  }, [sheetsConnected, config]);
+
+  // Auto-sync every 30s when connected
+  useEffect(() => {
+    if (!sheetsConnected) return;
+    const t = setInterval(pullFromSheets, 30000);
+    return () => clearInterval(t);
+  }, [sheetsConnected, pullFromSheets]);
+
+  // ── Sync income to Sheets ─────────────────────────────────────────────────
+  const syncIncome = (data) => {
+    pushToSheets(SHEETS.INCOME, data,
+      ["id","date","source","amount","tithing","needs","savings","wants"],
+      (r) => [r.id,r.date,r.source,r.amount,r.tithing,r.needs,r.savings,r.wants]
+    );
+  };
+  const syncJoint = (data) => {
+    pushToSheets(SHEETS.JOINT, data,
+      ["id","date","name","category","paidBy","amount"],
+      (r) => [r.id,r.date,r.name,r.category,r.paidBy,r.amount]
+    );
+  };
+  const syncGoals = (data) => {
+    pushToSheets(SHEETS.GOALS, data,
+      ["id","name","target","saved","monthly","category"],
+      (r) => [r.id,r.name,r.target,r.saved,r.monthly,r.category]
+    );
+  };
+  const syncPartnerA = (data) => {
+    pushToSheets(SHEETS.PARTNER_A, data,
+      ["id","date","name","category","amount","type"],
+      (r) => [r.id,r.date,r.name,r.category,r.amount,r.type]
+    );
+  };
+  const syncPartnerB = (data) => {
+    pushToSheets(SHEETS.PARTNER_B, data,
+      ["id","date","name","category","amount","type"],
+      (r) => [r.id,r.date,r.name,r.category,r.amount,r.type]
+    );
+  };
+
+  // ── COMPUTED TOTALS ───────────────────────────────────────────────────────
+  const filtered = {
+    income: income.filter((r) => r.date?.slice(0,7) === filterMonth),
+    joint: joint.filter((r) => r.date?.slice(0,7) === filterMonth),
+    partnerA: partnerA.filter((r) => r.date?.slice(0,7) === filterMonth),
+    partnerB: partnerB.filter((r) => r.date?.slice(0,7) === filterMonth),
+  };
+
+  const totalIncome = filtered.income.reduce((s, r) => s + Number(r.amount), 0);
+  const allocatedTithing = totalIncome * (allocPct.tithing / 100);
+  const allocatedNeeds = totalIncome * (allocPct.needs / 100);
+  const allocatedSavings = totalIncome * (allocPct.savings / 100);
+  const allocatedWants = totalIncome * (allocPct.wants / 100);
+
+  const jointTotal = filtered.joint.reduce((s, r) => s + Number(r.amount), 0);
+  const paidByA = filtered.joint.filter((r) => r.paidBy === partnerNames.a).reduce((s, r) => s + Number(r.amount), 0);
+  const paidByB = filtered.joint.filter((s) => s.paidBy === partnerNames.b).reduce((s, r) => s + Number(r.amount), 0);
+  const eachOwes = jointTotal / 2;
+  const aOwesB = Math.max(0, eachOwes - paidByA);
+  const bOwesA = Math.max(0, eachOwes - paidByB);
+
+  const aSpending = filtered.partnerA.reduce((s, r) => s + Number(r.amount), 0);
+  const bSpending = filtered.partnerB.reduce((s, r) => s + Number(r.amount), 0);
+
+  // ── PDF EXPORT ────────────────────────────────────────────────────────────
+  const exportPDF = () => {
+    const win = window.open("", "_blank");
+    const rows = (arr) => arr.map((r) => Object.values(r).join("\t")).join("\n");
+    win.document.write(`<pre style="font-family:monospace;font-size:12px;padding:20px">
+HOUSEHOLD BUDGET REPORT — ${filterMonth}
+======================================
+
+INCOME: ${fmt(totalIncome)}
+  Tithing (${allocPct.tithing}%): ${fmt(allocatedTithing)}
+  Needs   (${allocPct.needs}%): ${fmt(allocatedNeeds)}
+  Savings (${allocPct.savings}%): ${fmt(allocatedSavings)}
+  Wants   (${allocPct.wants}%): ${fmt(allocatedWants)}
+
+JOINT EXPENSES: ${fmt(jointTotal)}
+  ${partnerNames.a} paid: ${fmt(paidByA)}
+  ${partnerNames.b} paid: ${fmt(paidByB)}
+  ${aOwesB > 0 ? partnerNames.a+" owes "+partnerNames.b+": "+fmt(aOwesB) : partnerNames.b+" owes "+partnerNames.a+": "+fmt(bOwesA)}
+
+${partnerNames.a.toUpperCase()} PERSONAL: ${fmt(aSpending)}
+${rows(filtered.partnerA)}
+
+${partnerNames.b.toUpperCase()} PERSONAL: ${fmt(bSpending)}
+${rows(filtered.partnerB)}
+
+SAVINGS GOALS
+${goals.map((g) => `  ${g.name}: ${fmt(g.saved)} / ${fmt(g.target)} (${pct(g.saved, g.target)}%)`).join("\n")}
+    </pre>`);
+    win.print();
+  };
+
+  // ── INCOME OPERATIONS ─────────────────────────────────────────────────────
+  const addIncome = (entry) => {
+    const next = [{ id: uid(), ...entry }, ...income];
+    setIncome(next); syncIncome(next);
+  };
+  const deleteIncome = (id) => {
+    const next = income.filter((r) => r.id !== id);
+    setIncome(next); syncIncome(next);
+  };
+
+  // ── JOINT EXPENSE OPERATIONS ──────────────────────────────────────────────
+  const addJoint = (entry) => {
+    const next = [{ id: uid(), ...entry }, ...joint];
+    setJoint(next); syncJoint(next);
+  };
+  const deleteJoint = (id) => {
+    const next = joint.filter((r) => r.id !== id);
+    setJoint(next); syncJoint(next);
+  };
+
+  // ── PARTNER OPERATIONS ────────────────────────────────────────────────────
+  const addPartnerEntry = (who, entry) => {
+    if (who === "a") { const n = [{ id: uid(), ...entry }, ...partnerA]; setPartnerA(n); syncPartnerA(n); }
+    else { const n = [{ id: uid(), ...entry }, ...partnerB]; setPartnerB(n); syncPartnerB(n); }
+  };
+  const deletePartnerEntry = (who, id) => {
+    if (who === "a") { const n = partnerA.filter((r) => r.id !== id); setPartnerA(n); syncPartnerA(n); }
+    else { const n = partnerB.filter((r) => r.id !== id); setPartnerB(n); syncPartnerB(n); }
+  };
+
+  // ── GOAL OPERATIONS ───────────────────────────────────────────────────────
+  const saveGoal = (g) => {
+    const next = goals.some((x) => x.id === g.id) ? goals.map((x) => x.id === g.id ? g : x) : [...goals, g];
+    setGoals(next); syncGoals(next);
+    setEditingGoal(null);
+  };
+  const deleteGoal = (id) => {
+    const next = goals.filter((r) => r.id !== id);
+    setGoals(next); syncGoals(next);
+  };
+
+  // ── MONTH SELECTOR ────────────────────────────────────────────────────────
+  const months = [...new Set([...income, ...joint].map((r) => r.date?.slice(0, 7)).filter(Boolean))].sort().reverse();
+  if (!months.includes(filterMonth)) months.unshift(filterMonth);
+
+  // ─── RENDER ───────────────────────────────────────────────────────────────
+  const tabs = [
+    { id: "dashboard", label: "Overview" },
+    { id: "income", label: "Income" },
+    { id: "joint", label: "Joint" },
+    { id: "personal", label: "Personal" },
+    { id: "goals", label: "Goals" },
+  ];
+
+  const syncBadge = { local: { label: "Local only", bg: C.amberLight, color: C.amber }, synced: { label: "Synced", bg: C.greenLight, color: C.green }, syncing: { label: "Syncing...", bg: C.blueLight, color: C.blue }, error: { label: "Sync error", bg: C.coralLight, color: C.coral } }[syncStatus];
+
+  return (
+    <div style={{ fontFamily: "'Inter', 'Helvetica Neue', Arial, sans-serif", background: "#F6F7F9", minHeight: "100vh", color: C.gray800 }}>
+      {/* Google APIs */}
+      <script src="https://accounts.google.com/gsi/client" async />
+
+      {/* HEADER */}
+      <header style={{ background: C.white, borderBottom: `1px solid ${C.gray200}`, position: "sticky", top: 0, zIndex: 100 }}>
+        <div style={{ maxWidth: 1100, margin: "0 auto", padding: "0 16px", display: "flex", alignItems: "center", justifyContent: "space-between", height: 60 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <div style={{ width: 32, height: 32, background: C.blue, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+            </div>
+            <span style={{ fontWeight: 800, fontSize: 17, letterSpacing: "-0.02em", color: C.gray800 }}>HouseholdBudget</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <Badge label={syncBadge.label} color={syncBadge.color} bg={syncBadge.bg} />
+            {sheetsConnected && (
+              <button onClick={pullFromSheets} style={{ background: C.blueLight, color: C.blue, border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+                Refresh
+              </button>
+            )}
+            <select value={filterMonth} onChange={(e) => setFilterMonth(e.target.value)} style={{ ...inputStyle, width: "auto", fontSize: 13, padding: "6px 10px" }}>
+              {months.map((m) => <option key={m} value={m}>{m}</option>)}
+            </select>
+            <button onClick={() => setSettingsOpen(true)} style={{ background: C.gray100, border: "none", borderRadius: 99, width: 36, height: 36, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={C.gray600} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+            </button>
+          </div>
+        </div>
+        {/* NAV TABS */}
+        <div style={{ maxWidth: 1100, margin: "0 auto", padding: "0 16px", display: "flex", gap: 2, overflowX: "auto" }}>
+          {tabs.map((t) => (
+            <button key={t.id} onClick={() => setTab(t.id)} style={{ background: "none", border: "none", borderBottom: tab === t.id ? `2px solid ${C.blue}` : "2px solid transparent", padding: "10px 16px", fontSize: 14, fontWeight: tab === t.id ? 700 : 500, color: tab === t.id ? C.blue : C.gray600, cursor: "pointer", whiteSpace: "nowrap", transition: "all 0.15s" }}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </header>
+
+      {/* MAIN CONTENT */}
+      <main style={{ maxWidth: 1100, margin: "0 auto", padding: "24px 16px", paddingBottom: 48 }}>
+
+        {/* ── DASHBOARD TAB ────────────────────────────────────────────────── */}
+        {tab === "dashboard" && <DashboardTab
+          totalIncome={totalIncome} allocPct={allocPct}
+          allocatedTithing={allocatedTithing} allocatedNeeds={allocatedNeeds}
+          allocatedSavings={allocatedSavings} allocatedWants={allocatedWants}
+          jointTotal={jointTotal} paidByA={paidByA} paidByB={paidByB}
+          aOwesB={aOwesB} bOwesA={bOwesA} aSpending={aSpending} bSpending={bSpending}
+          partnerNames={partnerNames} goals={goals} isMobile={isMobile}
+          filtered={filtered}
+        />}
+
+        {/* ── INCOME TAB ───────────────────────────────────────────────────── */}
+        {tab === "income" && <IncomeTab
+          income={income} filtered={filtered}
+          totalIncome={totalIncome} allocPct={allocPct}
+          allocatedTithing={allocatedTithing} allocatedNeeds={allocatedNeeds}
+          allocatedSavings={allocatedSavings} allocatedWants={allocatedWants}
+          onAdd={addIncome} onDelete={deleteIncome} isMobile={isMobile}
+        />}
+
+        {/* ── JOINT EXPENSES TAB ───────────────────────────────────────────── */}
+        {tab === "joint" && <JointTab
+          joint={joint} filtered={filtered}
+          jointTotal={jointTotal} paidByA={paidByA} paidByB={paidByB}
+          eachOwes={eachOwes} aOwesB={aOwesB} bOwesA={bOwesA}
+          partnerNames={partnerNames} onAdd={addJoint} onDelete={deleteJoint} isMobile={isMobile}
+        />}
+
+        {/* ── PERSONAL TAB ─────────────────────────────────────────────────── */}
+        {tab === "personal" && <PersonalTab
+          partnerNames={partnerNames} personalTab={personalTab} setPersonalTab={setPersonalTab}
+          partnerA={partnerA} partnerB={partnerB} filtered={filtered}
+          aSpending={aSpending} bSpending={bSpending}
+          onAdd={addPartnerEntry} onDelete={deletePartnerEntry} isMobile={isMobile}
+        />}
+
+        {/* ── GOALS TAB ────────────────────────────────────────────────────── */}
+        {tab === "goals" && <GoalsTab
+          goals={goals} editingGoal={editingGoal} setEditingGoal={setEditingGoal}
+          onSave={saveGoal} onDelete={deleteGoal} isMobile={isMobile}
+        />}
+      </main>
+
+      {/* SETTINGS MODAL */}
+      <Modal open={settingsOpen} onClose={() => setSettingsOpen(false)} title="Settings">
+        <SettingsPanel
+          config={config} setConfig={setConfig}
+          partnerNames={partnerNames} setPartnerNames={setPartnerNames}
+          allocPct={allocPct} setAllocPct={setAllocPct}
+          sheetsConnected={sheetsConnected} onConnect={signInSheets}
+          onExportPDF={exportPDF}
+        />
+      </Modal>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DASHBOARD TAB
+// ═══════════════════════════════════════════════════════════════════════════════
+function DashboardTab({ totalIncome, allocPct, allocatedTithing, allocatedNeeds, allocatedSavings, allocatedWants, jointTotal, paidByA, paidByB, aOwesB, bOwesA, aSpending, bSpending, partnerNames, goals, isMobile, filtered }) {
+  const cols = isMobile ? "1fr" : "repeat(4, 1fr)";
+
+  const donutAlloc = [
+    { label: "Needs", value: allocPct.needs, color: C.blue },
+    { label: "Savings", value: allocPct.savings, color: C.teal },
+    { label: "Wants", value: allocPct.wants, color: C.amber },
+    { label: "Tithing", value: allocPct.tithing, color: C.coral },
+  ];
+
+  const actualSpent = [
+    { label: "Joint", value: jointTotal, color: C.blue },
+    { label: partnerNames.a, value: aSpending, color: C.teal },
+    { label: partnerNames.b, value: bSpending, color: C.coral },
+    { label: "Unspent", value: Math.max(0, totalIncome - jointTotal - aSpending - bSpending), color: C.gray200 },
+  ];
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {/* Stat Row */}
+      <div style={{ display: "grid", gridTemplateColumns: cols, gap: 12 }}>
+        <StatCard label="Total Income" value={fmt(totalIncome)} sub="this month" color={C.blue} />
+        <StatCard label="Tithing" value={fmt(allocatedTithing)} sub={`${allocPct.tithing}% of income`} color={C.coral} />
+        <StatCard label="Joint Expenses" value={fmt(jointTotal)} sub="shared spending" color={C.gray800} />
+        <StatCard label="Saved This Month" value={fmt(allocatedSavings)} sub={`${allocPct.savings}% of income`} color={C.teal} />
+      </div>
+
+      {/* Charts Row */}
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 16 }}>
+        <Card>
+          <div style={{ fontSize: 13, fontWeight: 700, color: C.gray600, marginBottom: 16, textTransform: "uppercase", letterSpacing: "0.04em" }}>Budget Allocation</div>
+          <DonutChart data={donutAlloc} size={160} thickness={28} label={fmt(totalIncome)} sublabel="income" />
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 16, justifyContent: "center" }}>
+            {donutAlloc.map((d) => <span key={d.label} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: C.gray600 }}><span style={{ width: 10, height: 10, borderRadius: 3, background: d.color, display: "inline-block" }} />{d.label} {d.value}%</span>)}
+          </div>
+        </Card>
+        <Card>
+          <div style={{ fontSize: 13, fontWeight: 700, color: C.gray600, marginBottom: 16, textTransform: "uppercase", letterSpacing: "0.04em" }}>Actual Spending</div>
+          <DonutChart data={actualSpent.filter(d => d.value > 0)} size={160} thickness={28} label={fmt(jointTotal + aSpending + bSpending)} sublabel="total spent" />
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 16, justifyContent: "center" }}>
+            {actualSpent.filter(d => d.label !== "Unspent" && d.value > 0).map((d) => <span key={d.label} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: C.gray600 }}><span style={{ width: 10, height: 10, borderRadius: 3, background: d.color, display: "inline-block" }} />{d.label}: {fmt(d.value)}</span>)}
+          </div>
+        </Card>
+      </div>
+
+      {/* Allocation vs Actual */}
+      <Card>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.gray600, marginBottom: 16, textTransform: "uppercase", letterSpacing: "0.04em" }}>Budget vs Actual</div>
+        {[
+          { label: "Needs", budget: allocatedNeeds, actual: jointTotal, color: C.blue },
+          { label: "Savings", budget: allocatedSavings, actual: 0, color: C.teal },
+          { label: "Wants", budget: allocatedWants, actual: aSpending + bSpending, color: C.amber },
+          { label: "Tithing", budget: allocatedTithing, actual: allocatedTithing, color: C.coral },
+        ].map((row) => (
+          <div key={row.label} style={{ marginBottom: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: C.gray800 }}>{row.label}</span>
+              <span style={{ fontSize: 12, color: C.gray600 }}>{fmt(row.actual)} / {fmt(row.budget)}</span>
+            </div>
+            <div style={{ position: "relative" }}>
+              <ProgressBar value={pct(row.actual, row.budget)} color={row.actual > row.budget ? C.coral : row.color} />
+            </div>
+            {row.actual > row.budget && <div style={{ fontSize: 11, color: C.coral, marginTop: 3 }}>Over budget by {fmt(row.actual - row.budget)}</div>}
+          </div>
+        ))}
+      </Card>
+
+      {/* Partner Contribution */}
+      <Card>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.gray600, marginBottom: 16, textTransform: "uppercase", letterSpacing: "0.04em" }}>Joint Contribution Status</div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          <div style={{ background: C.partnerALight, borderRadius: 12, padding: "14px 16px" }}>
+            <div style={{ fontSize: 12, color: C.teal, fontWeight: 700, marginBottom: 4 }}>{partnerNames.a}</div>
+            <div style={{ fontSize: 20, fontWeight: 800, color: C.teal }}>{fmt(paidByA)}</div>
+            <div style={{ fontSize: 12, color: C.gray600, marginTop: 2 }}>paid of joint</div>
+            {aOwesB > 0 && <div style={{ marginTop: 8, fontSize: 12, color: C.coral, fontWeight: 600 }}>Owes {partnerNames.b}: {fmt(aOwesB)}</div>}
+            {aOwesB === 0 && <div style={{ marginTop: 8, fontSize: 12, color: C.teal, fontWeight: 600 }}>All settled up</div>}
+          </div>
+          <div style={{ background: C.partnerBLight, borderRadius: 12, padding: "14px 16px" }}>
+            <div style={{ fontSize: 12, color: C.coral, fontWeight: 700, marginBottom: 4 }}>{partnerNames.b}</div>
+            <div style={{ fontSize: 20, fontWeight: 800, color: C.coral }}>{fmt(paidByB)}</div>
+            <div style={{ fontSize: 12, color: C.gray600, marginTop: 2 }}>paid of joint</div>
+            {bOwesA > 0 && <div style={{ marginTop: 8, fontSize: 12, color: C.coral, fontWeight: 600 }}>Owes {partnerNames.a}: {fmt(bOwesA)}</div>}
+            {bOwesA === 0 && <div style={{ marginTop: 8, fontSize: 12, color: C.teal, fontWeight: 600 }}>All settled up</div>}
+          </div>
+        </div>
+      </Card>
+
+      {/* Top Goals */}
+      <Card>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.gray600, marginBottom: 16, textTransform: "uppercase", letterSpacing: "0.04em" }}>Savings Goals</div>
+        {goals.slice(0, 4).map((g) => {
+          const p = pct(Number(g.saved), Number(g.target));
+          return (
+            <div key={g.id} style={{ marginBottom: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
+                <span style={{ fontSize: 13, fontWeight: 600 }}>{g.name}</span>
+                <span style={{ fontSize: 12, color: C.gray600 }}>{fmt(g.saved)} / {fmt(g.target)} — {p}%</span>
+              </div>
+              <ProgressBar value={p} color={p >= 100 ? C.green : C.blue} />
+            </div>
+          );
+        })}
+      </Card>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INCOME TAB
+// ═══════════════════════════════════════════════════════════════════════════════
+function IncomeTab({ income, filtered, totalIncome, allocPct, allocatedTithing, allocatedNeeds, allocatedSavings, allocatedWants, onAdd, onDelete, isMobile }) {
+  const [form, setForm] = useState({ date: today(), source: "", amount: "", tithing: "", needs: "", savings: "", wants: "" });
+  const [autoSplit, setAutoSplit] = useState(true);
+
+  const handleAmountChange = (val) => {
+    const amt = parseFloat(val) || 0;
+    if (autoSplit) {
+      setForm({ ...form, amount: val, tithing: (amt * allocPct.tithing / 100).toFixed(2), needs: (amt * allocPct.needs / 100).toFixed(2), savings: (amt * allocPct.savings / 100).toFixed(2), wants: (amt * allocPct.wants / 100).toFixed(2) });
+    } else {
+      setForm({ ...form, amount: val });
+    }
+  };
+
+  const handleSubmit = () => {
+    if (!form.source || !form.amount) return;
+    onAdd({ date: form.date, source: form.source, amount: Number(form.amount), tithing: Number(form.tithing), needs: Number(form.needs), savings: Number(form.savings), wants: Number(form.wants) });
+    setForm({ date: today(), source: "", amount: "", tithing: "", needs: "", savings: "", wants: "" });
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(4,1fr)", gap: 12 }}>
+        <StatCard label="Total Income" value={fmt(totalIncome)} color={C.blue} />
+        <StatCard label={`Tithing (${allocPct.tithing}%)`} value={fmt(allocatedTithing)} color={C.coral} />
+        <StatCard label={`Savings (${allocPct.savings}%)`} value={fmt(allocatedSavings)} color={C.teal} />
+        <StatCard label={`Wants (${allocPct.wants}%)`} value={fmt(allocatedWants)} color={C.amber} />
+      </div>
+
+      <Card>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.gray600, marginBottom: 16, textTransform: "uppercase", letterSpacing: "0.04em" }}>Add Income</div>
+        <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 2fr 1fr", gap: 10, marginBottom: 10 }}>
+          <div><label style={labelStyle}>Date</label><input type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} style={inputStyle} /></div>
+          <div><label style={labelStyle}>Source</label><input placeholder="e.g. Salary, Freelance" value={form.source} onChange={(e) => setForm({ ...form, source: e.target.value })} style={inputStyle} /></div>
+          <div><label style={labelStyle}>Amount</label><input type="number" placeholder="0.00" value={form.amount} onChange={(e) => handleAmountChange(e.target.value)} style={inputStyle} /></div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+          <input type="checkbox" id="autoSplit" checked={autoSplit} onChange={(e) => setAutoSplit(e.target.checked)} />
+          <label htmlFor="autoSplit" style={{ fontSize: 13, color: C.gray600 }}>Auto-split by budget percentages</label>
+        </div>
+        {!autoSplit && (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 10 }}>
+            {["tithing","needs","savings","wants"].map((k) => (
+              <div key={k}><label style={labelStyle}>{k}</label><input type="number" placeholder="0.00" value={form[k]} onChange={(e) => setForm({ ...form, [k]: e.target.value })} style={inputStyle} /></div>
+            ))}
+          </div>
+        )}
+        <button onClick={handleSubmit} style={{ background: C.blue, color: C.white, border: "none", borderRadius: 10, padding: "10px 24px", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>Add Income</button>
+      </Card>
+
+      <Card style={{ padding: 0, overflow: "hidden" }}>
+        <div style={{ padding: "16px 24px", borderBottom: `1px solid ${C.gray200}`, fontSize: 13, fontWeight: 700, color: C.gray600, textTransform: "uppercase", letterSpacing: "0.04em" }}>Income Entries — {filtered.income.length} records</div>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead><tr style={{ background: C.gray50 }}>
+              {["Date","Source","Amount","Tithing","Needs","Savings","Wants",""].map((h) => <th key={h} style={{ padding: "10px 16px", textAlign: "left", fontWeight: 700, color: C.gray600, borderBottom: `1px solid ${C.gray200}`, whiteSpace: "nowrap" }}>{h}</th>)}
+            </tr></thead>
+            <tbody>
+              {filtered.income.length === 0 && <tr><td colSpan={8} style={{ padding: 24, textAlign: "center", color: C.gray400, fontSize: 13 }}>No income entries for this month</td></tr>}
+              {filtered.income.map((r) => (
+                <tr key={r.id} style={{ borderBottom: `1px solid ${C.gray200}` }}>
+                  <td style={{ padding: "10px 16px", color: C.gray600 }}>{r.date}</td>
+                  <td style={{ padding: "10px 16px", fontWeight: 600 }}>{r.source}</td>
+                  <td style={{ padding: "10px 16px", fontWeight: 700, color: C.blue }}>{fmtDec(r.amount)}</td>
+                  <td style={{ padding: "10px 16px", color: C.coral }}>{fmtDec(r.tithing)}</td>
+                  <td style={{ padding: "10px 16px" }}>{fmtDec(r.needs)}</td>
+                  <td style={{ padding: "10px 16px", color: C.teal }}>{fmtDec(r.savings)}</td>
+                  <td style={{ padding: "10px 16px", color: C.amber }}>{fmtDec(r.wants)}</td>
+                  <td style={{ padding: "10px 16px" }}>
+                    <button onClick={() => onDelete(r.id)} style={{ background: C.coralLight, color: C.coral, border: "none", borderRadius: 6, padding: "4px 10px", fontSize: 11, cursor: "pointer", fontWeight: 600 }}>Remove</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+            {filtered.income.length > 0 && (
+              <tfoot><tr style={{ background: C.blueLight }}>
+                <td colSpan={2} style={{ padding: "10px 16px", fontWeight: 800, color: C.blue }}>TOTAL</td>
+                <td style={{ padding: "10px 16px", fontWeight: 800, color: C.blue }}>{fmt(filtered.income.reduce((s,r)=>s+Number(r.amount),0))}</td>
+                <td style={{ padding: "10px 16px", fontWeight: 700, color: C.coral }}>{fmt(filtered.income.reduce((s,r)=>s+Number(r.tithing),0))}</td>
+                <td style={{ padding: "10px 16px", fontWeight: 700 }}>{fmt(filtered.income.reduce((s,r)=>s+Number(r.needs),0))}</td>
+                <td style={{ padding: "10px 16px", fontWeight: 700, color: C.teal }}>{fmt(filtered.income.reduce((s,r)=>s+Number(r.savings),0))}</td>
+                <td style={{ padding: "10px 16px", fontWeight: 700, color: C.amber }}>{fmt(filtered.income.reduce((s,r)=>s+Number(r.wants),0))}</td>
+                <td />
+              </tr></tfoot>
+            )}
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JOINT EXPENSES TAB
+// ═══════════════════════════════════════════════════════════════════════════════
+const JOINT_CATS = ["Housing","Food","Utilities","Transport","Health","Insurance","Entertainment","Other"];
+
+function JointTab({ joint, filtered, jointTotal, paidByA, paidByB, eachOwes, aOwesB, bOwesA, partnerNames, onAdd, onDelete, isMobile }) {
+  const [form, setForm] = useState({ date: today(), name: "", category: "Housing", paidBy: partnerNames.a, amount: "" });
+  const [catFilter, setCatFilter] = useState("All");
+
+  const handleSubmit = () => {
+    if (!form.name || !form.amount) return;
+    onAdd({ date: form.date, name: form.name, category: form.category, paidBy: form.paidBy, amount: Number(form.amount) });
+    setForm({ date: today(), name: "", category: "Housing", paidBy: partnerNames.a, amount: "" });
+  };
+
+  const display = catFilter === "All" ? filtered.joint : filtered.joint.filter((r) => r.category === catFilter);
+
+  // Category breakdown
+  const byCat = JOINT_CATS.map((c) => ({ cat: c, total: filtered.joint.filter((r) => r.category === c).reduce((s,r)=>s+Number(r.amount),0) })).filter((x) => x.total > 0);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(4,1fr)", gap: 12 }}>
+        <StatCard label="Joint Total" value={fmt(jointTotal)} color={C.blue} bg={C.blueLight} />
+        <StatCard label={`${partnerNames.a} Paid`} value={fmt(paidByA)} color={C.teal} bg={C.tealLight} />
+        <StatCard label={`${partnerNames.b} Paid`} value={fmt(paidByB)} color={C.coral} bg={C.coralLight} />
+        <StatCard label="Each Owes" value={fmt(eachOwes)} color={C.gray800} sub="of joint total" />
+      </div>
+
+      {/* Settlement Status */}
+      <Card>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.gray600, marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.04em" }}>Settlement</div>
+        {aOwesB > 0 && <div style={{ background: C.coralLight, borderRadius: 10, padding: "10px 16px", fontSize: 14, color: C.coral, fontWeight: 600 }}>{partnerNames.a} owes {partnerNames.b} {fmt(aOwesB)} to settle up</div>}
+        {bOwesA > 0 && <div style={{ background: C.coralLight, borderRadius: 10, padding: "10px 16px", fontSize: 14, color: C.coral, fontWeight: 600 }}>{partnerNames.b} owes {partnerNames.a} {fmt(bOwesA)} to settle up</div>}
+        {aOwesB === 0 && bOwesA === 0 && <div style={{ background: C.greenLight, borderRadius: 10, padding: "10px 16px", fontSize: 14, color: C.green, fontWeight: 600 }}>All settled up — contributions are equal</div>}
+      </Card>
+
+      {/* Add Form */}
+      <Card>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.gray600, marginBottom: 16, textTransform: "uppercase", letterSpacing: "0.04em" }}>Add Joint Expense</div>
+        <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 2fr 1fr 1fr 1fr", gap: 10, marginBottom: 12 }}>
+          <div><label style={labelStyle}>Date</label><input type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} style={inputStyle} /></div>
+          <div><label style={labelStyle}>Expense Name</label><input placeholder="e.g. Rent, Groceries" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} style={inputStyle} /></div>
+          <div><label style={labelStyle}>Category</label><select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} style={inputStyle}>{JOINT_CATS.map((c)=><option key={c}>{c}</option>)}</select></div>
+          <div><label style={labelStyle}>Paid By</label><select value={form.paidBy} onChange={(e) => setForm({ ...form, paidBy: e.target.value })} style={inputStyle}><option>{partnerNames.a}</option><option>{partnerNames.b}</option></select></div>
+          <div><label style={labelStyle}>Amount</label><input type="number" placeholder="0.00" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} style={inputStyle} /></div>
+        </div>
+        <button onClick={handleSubmit} style={{ background: C.blue, color: C.white, border: "none", borderRadius: 10, padding: "10px 24px", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>Add Expense</button>
+      </Card>
+
+      {/* Category Filter */}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {["All", ...JOINT_CATS].map((c) => (
+          <button key={c} onClick={() => setCatFilter(c)} style={{ background: catFilter === c ? C.blue : C.white, color: catFilter === c ? C.white : C.gray600, border: `1px solid ${catFilter === c ? C.blue : C.gray200}`, borderRadius: 99, padding: "6px 14px", fontSize: 12, fontWeight: 600, cursor: "pointer", transition: "all 0.15s" }}>{c}</button>
+        ))}
+      </div>
+
+      <Card style={{ padding: 0, overflow: "hidden" }}>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead><tr style={{ background: C.gray50 }}>
+              {["Date","Name","Category","Paid By","Amount",""].map((h) => <th key={h} style={{ padding: "10px 16px", textAlign: "left", fontWeight: 700, color: C.gray600, borderBottom: `1px solid ${C.gray200}`, whiteSpace: "nowrap" }}>{h}</th>)}
+            </tr></thead>
+            <tbody>
+              {display.length === 0 && <tr><td colSpan={6} style={{ padding: 24, textAlign: "center", color: C.gray400 }}>No expenses for this filter</td></tr>}
+              {display.map((r) => (
+                <tr key={r.id} style={{ borderBottom: `1px solid ${C.gray200}` }}>
+                  <td style={{ padding: "10px 16px", color: C.gray600 }}>{r.date}</td>
+                  <td style={{ padding: "10px 16px", fontWeight: 600 }}>{r.name}</td>
+                  <td style={{ padding: "10px 16px" }}><Badge label={r.category} color={C.blue} bg={C.blueLight} /></td>
+                  <td style={{ padding: "10px 16px" }}>
+                    <Badge label={r.paidBy} color={r.paidBy === partnerNames.a ? C.teal : C.coral} bg={r.paidBy === partnerNames.a ? C.tealLight : C.coralLight} />
+                  </td>
+                  <td style={{ padding: "10px 16px", fontWeight: 700 }}>{fmtDec(r.amount)}</td>
+                  <td style={{ padding: "10px 16px" }}>
+                    <button onClick={() => onDelete(r.id)} style={{ background: C.coralLight, color: C.coral, border: "none", borderRadius: 6, padding: "4px 10px", fontSize: 11, cursor: "pointer", fontWeight: 600 }}>Remove</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+            {display.length > 0 && <tfoot><tr style={{ background: C.blueLight }}>
+              <td colSpan={4} style={{ padding: "10px 16px", fontWeight: 800, color: C.blue }}>TOTAL</td>
+              <td style={{ padding: "10px 16px", fontWeight: 800, color: C.blue }}>{fmt(display.reduce((s,r)=>s+Number(r.amount),0))}</td>
+              <td />
+            </tr></tfoot>}
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PERSONAL TAB
+// ═══════════════════════════════════════════════════════════════════════════════
+const PERSONAL_CATS = ["Bills","Wants","Savings","Health","Entertainment","Food","Transport","Other"];
+const PERSONAL_TYPES = ["Bill","Want","Savings"];
+
+function PersonalTab({ partnerNames, personalTab, setPersonalTab, partnerA, partnerB, filtered, aSpending, bSpending, onAdd, onDelete, isMobile }) {
+  const isA = personalTab === "a";
+  const name = isA ? partnerNames.a : partnerNames.b;
+  const color = isA ? C.teal : C.coral;
+  const lightColor = isA ? C.tealLight : C.coralLight;
+  const data = isA ? filtered.partnerA : filtered.partnerB;
+  const total = isA ? aSpending : bSpending;
+
+  const [form, setForm] = useState({ date: today(), name: "", category: "Bills", type: "Bill", amount: "" });
+
+  const handleSubmit = () => {
+    if (!form.name || !form.amount) return;
+    onAdd(personalTab, { date: form.date, name: form.name, category: form.category, type: form.type, amount: Number(form.amount) });
+    setForm({ date: today(), name: "", category: "Bills", type: "Bill", amount: "" });
+  };
+
+  const byType = PERSONAL_TYPES.map((t) => ({ type: t, total: data.filter((r)=>r.type===t).reduce((s,r)=>s+Number(r.amount),0) }));
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {/* Partner Switch */}
+      <div style={{ display: "flex", gap: 8 }}>
+        {[["a", partnerNames.a, C.teal, C.tealLight], ["b", partnerNames.b, C.coral, C.coralLight]].map(([key, label, col, bg]) => (
+          <button key={key} onClick={() => setPersonalTab(key)} style={{ background: personalTab === key ? col : C.white, color: personalTab === key ? C.white : col, border: `2px solid ${col}`, borderRadius: 10, padding: "10px 24px", fontSize: 14, fontWeight: 700, cursor: "pointer", transition: "all 0.15s" }}>{label}</button>
+        ))}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(4,1fr)", gap: 12 }}>
+        <StatCard label="Total Spending" value={fmt(total)} color={color} bg={lightColor} />
+        {byType.map((t) => <StatCard key={t.type} label={t.type + "s"} value={fmt(t.total)} color={color} />)}
+      </div>
+
+      <Card>
+        <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 16, textTransform: "uppercase", letterSpacing: "0.04em" }} style={{ color: C.gray600 }}>Add Entry — {name}</div>
+        <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 2fr 1fr 1fr 1fr", gap: 10, marginBottom: 12 }}>
+          <div><label style={labelStyle}>Date</label><input type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} style={inputStyle} /></div>
+          <div><label style={labelStyle}>Description</label><input placeholder="e.g. Gym, Coffee" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} style={inputStyle} /></div>
+          <div><label style={labelStyle}>Type</label><select value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })} style={inputStyle}>{PERSONAL_TYPES.map((t)=><option key={t}>{t}</option>)}</select></div>
+          <div><label style={labelStyle}>Category</label><select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} style={inputStyle}>{PERSONAL_CATS.map((c)=><option key={c}>{c}</option>)}</select></div>
+          <div><label style={labelStyle}>Amount</label><input type="number" placeholder="0.00" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} style={inputStyle} /></div>
+        </div>
+        <button onClick={handleSubmit} style={{ background: color, color: C.white, border: "none", borderRadius: 10, padding: "10px 24px", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>Add Entry</button>
+      </Card>
+
+      <Card style={{ padding: 0, overflow: "hidden" }}>
+        <div style={{ padding: "16px 24px", borderBottom: `1px solid ${C.gray200}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: C.gray600, textTransform: "uppercase", letterSpacing: "0.04em" }}>{name} — {data.length} entries</span>
+          <Badge label={fmt(total)} color={color} bg={lightColor} />
+        </div>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead><tr style={{ background: C.gray50 }}>
+              {["Date","Description","Type","Category","Amount",""].map((h) => <th key={h} style={{ padding: "10px 16px", textAlign: "left", fontWeight: 700, color: C.gray600, borderBottom: `1px solid ${C.gray200}` }}>{h}</th>)}
+            </tr></thead>
+            <tbody>
+              {data.length === 0 && <tr><td colSpan={6} style={{ padding: 24, textAlign: "center", color: C.gray400 }}>No entries for this month</td></tr>}
+              {data.map((r) => (
+                <tr key={r.id} style={{ borderBottom: `1px solid ${C.gray200}` }}>
+                  <td style={{ padding: "10px 16px", color: C.gray600 }}>{r.date}</td>
+                  <td style={{ padding: "10px 16px", fontWeight: 600 }}>{r.name}</td>
+                  <td style={{ padding: "10px 16px" }}><Badge label={r.type} color={color} bg={lightColor} /></td>
+                  <td style={{ padding: "10px 16px", color: C.gray600 }}>{r.category}</td>
+                  <td style={{ padding: "10px 16px", fontWeight: 700 }}>{fmtDec(r.amount)}</td>
+                  <td style={{ padding: "10px 16px" }}>
+                    <button onClick={() => onDelete(personalTab, r.id)} style={{ background: C.coralLight, color: C.coral, border: "none", borderRadius: 6, padding: "4px 10px", fontSize: 11, cursor: "pointer", fontWeight: 600 }}>Remove</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GOALS TAB
+// ═══════════════════════════════════════════════════════════════════════════════
+const GOAL_CATS = ["Emergency","Business","Want","Maintenance","Investment","Other"];
+const GOAL_COLORS = { Emergency: C.coral, Business: C.teal, Want: C.amber, Maintenance: C.blue, Investment: C.green, Other: C.gray400 };
+
+function GoalsTab({ goals, editingGoal, setEditingGoal, onSave, onDelete, isMobile }) {
+  const [form, setForm] = useState({ id: null, name: "", target: "", saved: "", monthly: "", category: "Emergency" });
+
+  const openNew = () => { setForm({ id: uid(), name: "", target: "", saved: "", monthly: "", category: "Emergency" }); setEditingGoal("new"); };
+  const openEdit = (g) => { setForm({ ...g }); setEditingGoal(g.id); };
+
+  const handleSave = () => {
+    if (!form.name || !form.target) return;
+    onSave({ ...form, target: Number(form.target), saved: Number(form.saved), monthly: Number(form.monthly) });
+    setForm({ id: null, name: "", target: "", saved: "", monthly: "", category: "Emergency" });
+  };
+
+  const totalTarget = goals.reduce((s, g) => s + Number(g.target), 0);
+  const totalSaved = goals.reduce((s, g) => s + Number(g.saved), 0);
+  const totalMonthly = goals.reduce((s, g) => s + Number(g.monthly), 0);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(3,1fr)", gap: 12 }}>
+        <StatCard label="Total Saved" value={fmt(totalSaved)} color={C.teal} bg={C.tealLight} />
+        <StatCard label="Total Target" value={fmt(totalTarget)} color={C.blue} />
+        <StatCard label="Monthly Contributions" value={fmt(totalMonthly)} color={C.amber} />
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: C.gray800 }}>Savings Goals</h3>
+        <button onClick={openNew} style={{ background: C.blue, color: C.white, border: "none", borderRadius: 10, padding: "10px 20px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Add Goal</button>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(2,1fr)", gap: 16 }}>
+        {goals.map((g) => {
+          const p = pct(Number(g.saved), Number(g.target));
+          const color = GOAL_COLORS[g.category] || C.blue;
+          const monthsLeft = g.monthly > 0 ? Math.ceil((g.target - g.saved) / g.monthly) : null;
+          return (
+            <Card key={g.id} style={{ position: "relative" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12 }}>
+                <div>
+                  <div style={{ fontSize: 16, fontWeight: 800, color: C.gray800, marginBottom: 2 }}>{g.name}</div>
+                  <Badge label={g.category} color={color} bg={color + "22"} />
+                </div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button onClick={() => openEdit(g)} style={{ background: C.gray100, border: "none", borderRadius: 6, padding: "5px 10px", fontSize: 11, cursor: "pointer", color: C.gray600, fontWeight: 600 }}>Edit</button>
+                  <button onClick={() => onDelete(g.id)} style={{ background: C.coralLight, border: "none", borderRadius: 6, padding: "5px 10px", fontSize: 11, cursor: "pointer", color: C.coral, fontWeight: 600 }}>Remove</button>
+                </div>
+              </div>
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                  <span style={{ fontSize: 22, fontWeight: 800, color }}>
+                    {fmt(g.saved)}
+                    <span style={{ fontSize: 13, fontWeight: 500, color: C.gray400 }}> / {fmt(g.target)}</span>
+                  </span>
+                  <span style={{ fontSize: 20, fontWeight: 800, color: p >= 100 ? C.green : color }}>{p}%</span>
+                </div>
+                <ProgressBar value={p} color={p >= 100 ? C.green : color} height={10} />
+              </div>
+              <div style={{ display: "flex", gap: 16, fontSize: 12, color: C.gray600 }}>
+                <span>Monthly: <strong style={{ color: C.gray800 }}>{fmt(g.monthly)}</strong></span>
+                {monthsLeft !== null && p < 100 && <span>Est. <strong style={{ color: C.gray800 }}>{monthsLeft} mo</strong> to goal</span>}
+                {p >= 100 && <span style={{ color: C.green, fontWeight: 700 }}>Goal reached!</span>}
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+
+      {/* Edit/Add Modal */}
+      <Modal open={!!editingGoal} onClose={() => setEditingGoal(null)} title={form.id && goals.some(g=>g.id===form.id) ? "Edit Goal" : "New Goal"}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div><label style={labelStyle}>Goal Name</label><input placeholder="e.g. Emergency Fund" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} style={inputStyle} /></div>
+          <div><label style={labelStyle}>Category</label><select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} style={inputStyle}>{GOAL_CATS.map((c)=><option key={c}>{c}</option>)}</select></div>
+          <div><label style={labelStyle}>Target Amount</label><input type="number" placeholder="10000" value={form.target} onChange={(e) => setForm({ ...form, target: e.target.value })} style={inputStyle} /></div>
+          <div><label style={labelStyle}>Saved So Far</label><input type="number" placeholder="0" value={form.saved} onChange={(e) => setForm({ ...form, saved: e.target.value })} style={inputStyle} /></div>
+          <div><label style={labelStyle}>Monthly Contribution</label><input type="number" placeholder="200" value={form.monthly} onChange={(e) => setForm({ ...form, monthly: e.target.value })} style={inputStyle} /></div>
+          <button onClick={handleSave} style={{ background: C.blue, color: C.white, border: "none", borderRadius: 10, padding: "12px", fontSize: 14, fontWeight: 700, cursor: "pointer", marginTop: 4 }}>Save Goal</button>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SETTINGS PANEL
+// ═══════════════════════════════════════════════════════════════════════════════
+function SettingsPanel({ config, setConfig, partnerNames, setPartnerNames, allocPct, setAllocPct, sheetsConnected, onConnect, onExportPDF }) {
+  const [local, setLocal] = useState(config);
+  const [names, setNames] = useState(partnerNames);
+  const [alloc, setAlloc] = useState(allocPct);
+  const total = Object.values(alloc).reduce((s, v) => s + Number(v), 0);
+
+  const saveAll = () => {
+    setConfig(local);
+    setPartnerNames(names);
+    setAllocPct({ tithing: Number(alloc.tithing), needs: Number(alloc.needs), savings: Number(alloc.savings), wants: Number(alloc.wants) });
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {/* Partner Names */}
+      <div>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.gray600, marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.04em" }}>Partner Names</div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          <div><label style={labelStyle}>Partner A</label><input value={names.a} onChange={(e) => setNames({ ...names, a: e.target.value })} style={inputStyle} /></div>
+          <div><label style={labelStyle}>Partner B</label><input value={names.b} onChange={(e) => setNames({ ...names, b: e.target.value })} style={inputStyle} /></div>
+        </div>
+      </div>
+
+      {/* Budget Percentages */}
+      <div>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.gray600, marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.04em" }}>Budget Allocation</div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 8 }}>
+          {[["tithing","Tithing"],["needs","Needs"],["savings","Savings"],["wants","Wants"]].map(([k,l]) => (
+            <div key={k}>
+              <label style={labelStyle}>{l} %</label>
+              <input type="number" min="0" max="100" value={alloc[k]} onChange={(e) => setAlloc({ ...alloc, [k]: e.target.value })} style={inputStyle} />
+            </div>
+          ))}
+        </div>
+        <div style={{ fontSize: 12, color: total === 100 ? C.green : C.coral, fontWeight: 600 }}>Total: {total}% {total !== 100 ? "(must equal 100%)" : "— looks good"}</div>
+      </div>
+
+      {/* Google Sheets */}
+      <div>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.gray600, marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.04em" }}>Google Sheets Sync</div>
+        <div style={{ background: C.gray50, borderRadius: 10, padding: "12px 14px", fontSize: 12, color: C.gray600, marginBottom: 10, lineHeight: 1.6 }}>
+          <strong>Setup:</strong> Create a Google Sheet with tabs named: Income, JointExpenses, PartnerA, PartnerB, Goals, Config. Then enable the Google Sheets API and OAuth in Google Cloud Console.
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 10 }}>
+          <div><label style={labelStyle}>Spreadsheet ID</label><input placeholder="From the URL: spreadsheets/d/THIS_PART/edit" value={local.spreadsheetId} onChange={(e) => setLocal({ ...local, spreadsheetId: e.target.value })} style={inputStyle} /></div>
+          <div><label style={labelStyle}>API Key</label><input placeholder="AIza..." value={local.apiKey} onChange={(e) => setLocal({ ...local, apiKey: e.target.value })} style={inputStyle} /></div>
+          <div><label style={labelStyle}>OAuth Client ID</label><input placeholder="XXXX.apps.googleusercontent.com" value={local.clientId} onChange={(e) => setLocal({ ...local, clientId: e.target.value })} style={inputStyle} /></div>
+        </div>
+        <button onClick={onConnect} style={{ background: sheetsConnected ? C.greenLight : C.blue, color: sheetsConnected ? C.green : C.white, border: "none", borderRadius: 10, padding: "10px 20px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+          {sheetsConnected ? "Connected to Google Sheets" : "Connect Google Sheets"}
+        </button>
+      </div>
+
+      <button onClick={saveAll} style={{ background: C.gray800, color: C.white, border: "none", borderRadius: 10, padding: "12px", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>Save Settings</button>
+
+      {/* PDF Export — tucked at bottom */}
+      <div style={{ borderTop: `1px solid ${C.gray200}`, paddingTop: 16 }}>
+        <div style={{ fontSize: 11, color: C.gray400, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.04em" }}>Export</div>
+        <button onClick={onExportPDF} style={{ background: C.gray100, color: C.gray600, border: `1px solid ${C.gray200}`, borderRadius: 8, padding: "8px 16px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Export as PDF</button>
+      </div>
+    </div>
+  );
+}
